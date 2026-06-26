@@ -31,6 +31,8 @@ import time
 import shutil
 import threading
 import subprocess
+import webbrowser
+import socket
 from datetime import datetime
 
 import psutil
@@ -51,6 +53,10 @@ MARCADOR_EXE = os.path.join("claude", "versions")
 
 DIR_PROJETOS = os.path.expanduser("~/.claude/projects")
 DIR_IDE_LOCKS = os.path.expanduser("~/.claude/ide")
+DIR_PI_SESSOES = os.path.expanduser("~/.pi/agent/sessions")
+PI_ATIVO_MAX_S = int(os.getenv("PI_ATIVO_MAX_S", "180"))  # sessão pi ativa por janela de atualização
+DASHBOARD_URL = "http://localhost:9000"
+AUDIO_ENABLED = True
 
 # Binário do VSCode para focar a janela (clicar numa instância "troca de janela").
 # Quando o app é aberto pelo Finder o PATH pode não ter /usr/local/bin, então
@@ -143,12 +149,8 @@ def focar_janela(workspace):
         print(f"Falha ao focar a janela: {exc}", file=sys.stderr)
 
 
-def caminhos_instancias():
-    """Retorna [(jsonl, cwd)] das sessões com processo `claude` vivo.
-
-    Agrupa os processos por cwd e, para cada cwd, associa os N transcripts mais
-    recentes (N = nº de processos naquele diretório).
-    """
+def caminhos_instancias_claude():
+    """Retorna [(jsonl, cwd, fonte)] das sessões *ativas* do Claude (por processo vivo)."""
     por_cwd = {}
     for proc in processos_claude():
         try:
@@ -165,8 +167,40 @@ def caminhos_instancias():
         jsonls = glob.glob(os.path.join(pasta, "*.jsonl"))
         jsonls.sort(key=lambda p: os.path.getmtime(p), reverse=True)
         for j in jsonls[:n]:
-            instancias.append((j, cwd))
+            instancias.append((j, cwd, "claude"))
     return instancias
+
+
+def caminhos_instancias_pi(agora=None):
+    """Retorna [(jsonl, pseudo_cwd, fonte)] de sessões *recentes* do pi agent.
+
+    Como o pi nem sempre tem um processo fácil de identificar aqui, usamos um
+    critério robusto de atividade: transcript atualizado nos últimos PI_ATIVO_MAX_S.
+    """
+    if agora is None:
+        agora = time.time()
+    if not os.path.isdir(DIR_PI_SESSOES):
+        return []
+
+    instancias = []
+    for pasta in glob.glob(os.path.join(DIR_PI_SESSOES, "*")):
+        if not os.path.isdir(pasta):
+            continue
+        jsonls = glob.glob(os.path.join(pasta, "*.jsonl"))
+        if not jsonls:
+            continue
+        mais_recente = max(jsonls, key=os.path.getmtime)
+        mtime = os.path.getmtime(mais_recente)
+        if agora - mtime <= PI_ATIVO_MAX_S:
+            pseudo_cwd = os.path.basename(pasta)
+            instancias.append((mais_recente, pseudo_cwd, "pi"))
+    return instancias
+
+
+def caminhos_instancias():
+    """Instâncias ativas combinadas (Claude por processo + pi por atividade recente)."""
+    agora = time.time()
+    return caminhos_instancias_claude() + caminhos_instancias_pi(agora=agora)
 
 
 # ---------------------------------------------------------------------------
@@ -185,6 +219,13 @@ def ler_cauda(path, nbytes=65536):
     return linhas
 
 
+def ler_cabeca(path, nbytes=32768):
+    """Lê o início do arquivo (útil para metadados como cwd no pi)."""
+    with open(path, "rb") as f:
+        dados = f.read(nbytes)
+    return dados.decode("utf-8", "ignore").splitlines()
+
+
 def _parse_ts(s):
     if not s:
         return None
@@ -194,15 +235,38 @@ def _parse_ts(s):
         return None
 
 
+def obter_cwd_pi(path):
+    """Extrai o cwd real de um transcript do pi (evento type=session)."""
+    try:
+        for ln in ler_cabeca(path, nbytes=32768):
+            try:
+                o = json.loads(ln)
+            except json.JSONDecodeError:
+                continue
+            if o.get("type") == "session" and o.get("cwd"):
+                return o.get("cwd")
+    except OSError:
+        return None
+    return None
+
+
 def analisar_sessao(path):
-    """Extrai do transcript os sinais usados para decidir a cor da sessão."""
+    """Extrai do transcript sinais para decidir cor e pendência de atenção humana."""
     info = {
         "titulo": None,
         "last_prompt": None,
         "last_ts": None,
         "end_turn": False,
         "erro": False,
+        "needs_attention": False,
+        "attention_since": None,
+        "attention_reason": None,  # end_turn | error
     }
+
+    last_user_ts = None
+    attention_ts = None
+    attention_reason = None
+
     for ln in ler_cauda(path):
         try:
             o = json.loads(ln)
@@ -214,42 +278,69 @@ def analisar_sessao(path):
             info["titulo"] = o["aiTitle"]
         elif tipo == "last-prompt" and o.get("lastPrompt"):
             info["last_prompt"] = o["lastPrompt"]
-        elif tipo in ("assistant", "user"):
+        elif tipo in ("assistant", "user", "message"):
             msg = o.get("message") or {}
-            ts = _parse_ts(o.get("timestamp"))
+            ts = _parse_ts(o.get("timestamp")) or _parse_ts(msg.get("timestamp"))
             if ts is None:
                 continue
-            # Como percorremos em ordem, estes campos refletem o ÚLTIMO evento.
+
             info["last_ts"] = ts
             role = msg.get("role")
-            info["end_turn"] = role == "assistant" and msg.get("stop_reason") == "end_turn"
+            stop_reason = msg.get("stop_reason") or msg.get("stopReason")
+
+            # Usuário respondeu: limpa pendência anterior.
+            if role == "user":
+                last_user_ts = ts
+
+            # Assistant finalizou turno => normalmente aguarda usuário.
+            if role == "assistant" and stop_reason in ("end_turn", "endTurn"):
+                attention_ts = ts
+                attention_reason = "end_turn"
+
+            # Erros de ferramenta (Claude e pi) => requer atenção humana.
             erro = False
             content = msg.get("content")
             if isinstance(content, list):
                 for c in content:
                     if isinstance(c, dict) and c.get("type") == "tool_result" and c.get("is_error"):
                         erro = True
+            if role == "toolResult" and (msg.get("isError") or msg.get("is_error")):
+                erro = True
+            if erro:
+                attention_ts = ts
+                attention_reason = "error"
+
             info["erro"] = erro
+            info["end_turn"] = role == "assistant" and stop_reason in ("end_turn", "endTurn")
+
+    # Pendência é "sticky" até usuário mandar nova mensagem após a pendência.
+    if attention_ts is not None and (last_user_ts is None or last_user_ts < attention_ts):
+        info["needs_attention"] = True
+        info["attention_since"] = attention_ts
+        info["attention_reason"] = attention_reason
+
     return info
 
 
 def estado_cor(info, agora):
     """Mapeia os sinais da sessão para verde / amarelo / vermelho."""
     if info["last_ts"] is None:
-        return "yellow"  # sessão sem eventos legíveis ainda
-    idade = agora - info["last_ts"]
+        return "yellow"
 
-    if info["erro"]:
-        return "red"
-    if info["end_turn"]:
-        # Turno encerrado: está te esperando. Se esperou demais, vira vermelho.
+    # Se precisa de atenção humana, não volta para verde sozinho.
+    if info.get("needs_attention"):
+        base_ts = info.get("attention_since") or info["last_ts"]
+        idade = agora - base_ts
+        if info.get("attention_reason") == "error":
+            return "red"
         return "yellow" if idade < VERMELHO_MIN_S else "red"
-    # Em trabalho (ciclo de ferramentas / pensando):
+
+    idade = agora - info["last_ts"]
     if idade < VERDE_MAX_S:
-        return "green"               # produzindo
+        return "green"
     if idade < VERMELHO_MIN_S:
-        return "yellow"              # pausada (ex.: aguardando permissão)
-    return "red"                     # travada/sem resposta há muito tempo
+        return "yellow"
+    return "red"
 
 
 def formatar_duracao(segundos):
@@ -292,23 +383,42 @@ class Monitor:
         agora = time.time()
         workspaces = carregar_workspaces()
         atuais = []
-        for path, cwd in caminhos_instancias():
+        for path, cwd, fonte in caminhos_instancias():
             try:
                 info = analisar_sessao(path)
             except OSError:
                 continue
-            sid = os.path.basename(path)[:-6]  # remove ".jsonl"
+
+            cwd_real = cwd
+            if fonte == "pi":
+                cwd_extraido = obter_cwd_pi(path)
+                if cwd_extraido:
+                    cwd_real = cwd_extraido
+
+            sid_base = os.path.basename(path)[:-6]  # remove ".jsonl"
+            sid = f"{fonte}:{sid_base}"
             cor = estado_cor(info, agora)
-            titulo = info["titulo"] or os.path.basename(cwd) or sid[:8]
+            # Regra específica do PI: se ficou idle sem erro, mantém amarelo
+            # (não degrada para vermelho apenas por tempo).
+            if fonte == "pi" and cor == "red" and not info.get("erro"):
+                cor = "yellow"
+            titulo_base = info["titulo"] or os.path.basename(cwd_real) or sid_base[:8]
+            prefixo = "[PI]" if fonte == "pi" else "[Claude]"
+            titulo = f"{prefixo} {titulo_base}"
+            workspace = resolver_workspace(cwd_real, workspaces)
             atuais.append(
                 {
                     "sid": sid,
+                    "fonte": fonte,
                     "cor": cor,
                     "titulo": titulo,
-                    "projeto": os.path.basename(cwd) or cwd,
-                    "workspace": resolver_workspace(cwd, workspaces),
-                    "last_ts": info["last_ts"],
+                    "projeto": os.path.basename(cwd_real) or cwd_real,
+                    "workspace": workspace,
+                    "last_ts": info["last_ts"] or os.path.getmtime(path),
                     "last_prompt": info["last_prompt"],
+                    "transcript_path": path,
+                    "needs_attention": bool(info.get("needs_attention")),
+                    "attention_reason": info.get("attention_reason"),
                 }
             )
 
@@ -362,11 +472,11 @@ monitor = Monitor()
 def _linha_principal():
     instancias, alt, _ = monitor.snapshot()
     if not instancias:
-        return "Nenhuma instância do Claude rodando"
+        return "Nenhuma instância ativa (Claude/PI)"
     for inst in instancias:
         if inst["sid"] == alt:
             return f"Última alteração: {EMOJI[inst['cor']]} {inst['titulo']}"
-    return "Instâncias do Claude"
+    return "Instâncias ativas (Claude/PI)"
 
 
 def _texto_ultima_checagem(item=None):
@@ -379,6 +489,51 @@ def _texto_ultima_checagem(item=None):
 def _acao_focar(workspace):
     """Cria o callback de clique que foca a janela do workspace informado."""
     return lambda icon, item: focar_janela(workspace)
+
+
+def _abrir_dashboard(icon=None, item=None):
+    try:
+        webbrowser.open(DASHBOARD_URL)
+    except Exception as exc:
+        print(f"Falha ao abrir dashboard: {exc}", file=sys.stderr)
+
+
+def _descobrir_ip_local():
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "localhost"
+
+
+def _sincronizar_celular(icon=None, item=None):
+    ip = _descobrir_ip_local()
+    url = f"http://{ip}:9000/mobile"
+    try:
+        webbrowser.open(url)
+        try:
+            icon.notify(f"Abra no celular: {url}", "Sync celular")
+        except Exception:
+            pass
+    except Exception as exc:
+        print(f"Falha ao abrir sync mobile: {exc}", file=sys.stderr)
+
+
+def _alternar_audio(icon=None, item=None):
+    global AUDIO_ENABLED
+    AUDIO_ENABLED = not AUDIO_ENABLED
+
+
+def _teste_audio(icon=None, item=None):
+    if not AUDIO_ENABLED:
+        return
+    try:
+        subprocess.Popen(["afplay", "/System/Library/Sounds/Glass.aiff"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        print("\a", end="", flush=True)
 
 
 def construir_menu():
@@ -404,6 +559,10 @@ def construir_menu():
         Menu.SEPARATOR,
         MenuItem(_texto_ultima_checagem, None, enabled=False),
         MenuItem("Atualizar agora", lambda icon, item: checar(icon)),
+        MenuItem("Abrir dashboard", _abrir_dashboard),
+        MenuItem("Sync no celular", _sincronizar_celular),
+        MenuItem(lambda item: f"Áudio: {'ligado' if AUDIO_ENABLED else 'desligado'}", _alternar_audio),
+        MenuItem("Testar áudio", _teste_audio),
         Menu.SEPARATOR,
         MenuItem("Sair", lambda icon, item: icon.stop()),
     ]
@@ -414,7 +573,10 @@ def construir_menu():
 # Loop de monitoramento
 # ---------------------------------------------------------------------------
 def checar(icon):
+    antes, _, _ = monitor.snapshot()
+    attention_antes = {i["sid"]: bool(i.get("needs_attention")) for i in antes}
     cor_anterior = monitor.cor_principal()
+
     try:
         monitor.coletar()
     except Exception as exc:  # nunca deixa o loop morrer
@@ -424,15 +586,36 @@ def checar(icon):
     instancias, _, _ = monitor.snapshot()
 
     icon.icon = ICONES[cor]
-    icon.title = f"Claude: {len(instancias)} instância(s) · principal {EMOJI[cor]}"
+    qt_pi = sum(1 for i in instancias if i.get("fonte") == "pi")
+    qt_claude = sum(1 for i in instancias if i.get("fonte") == "claude")
+    icon.title = (
+        f"Monitor: {len(instancias)} · Claude {qt_claude} · PI {qt_pi} "
+        f"· principal {EMOJI[cor]}"
+    )
     icon.menu = construir_menu()
     icon.update_menu()
 
+    # Notificação quando status principal muda.
     if cor != cor_anterior:
         try:
-            icon.notify(f"Status principal: {ESTADO_TEXTO[cor]}", "Monitoramento do Claude")
+            icon.notify(f"Status principal: {ESTADO_TEXTO[cor]}", "Monitoramento Claude + PI")
         except Exception:
             pass
+        if AUDIO_ENABLED:
+            _teste_audio()
+
+    # Notificação de pendência nova (precisa de você), mesmo sem trocar cor principal.
+    for inst in instancias:
+        sid = inst["sid"]
+        agora_attention = bool(inst.get("needs_attention"))
+        if agora_attention and not attention_antes.get(sid, False):
+            motivo = "erro" if inst.get("attention_reason") == "error" else "aguardando sua ação"
+            try:
+                icon.notify(f"{inst['titulo']} · {motivo}", "Ação necessária")
+            except Exception:
+                pass
+            if AUDIO_ENABLED:
+                _teste_audio()
 
 
 def monitorar(icon):
@@ -448,7 +631,7 @@ def modo_check():
     monitor.coletar()
     instancias, alt, _ = monitor.snapshot()
     if not instancias:
-        print("Nenhuma instância do Claude rodando.")
+        print("Nenhuma instância ativa de Claude/PI.")
         return 1
 
     agora = time.time()
@@ -458,7 +641,10 @@ def modo_check():
         marca = "  <- última alteração" if inst["sid"] == alt else ""
         print(f"  {EMOJI[inst['cor']]} {ESTADO_TEXTO[inst['cor']]:<14} ({idade:>5}) "
               f" {inst['titulo']}{marca}")
-        print(f"        janela: {inst['workspace']}")
+        if inst.get("workspace"):
+            print(f"        janela: {inst['workspace']}")
+        else:
+            print("        janela: —")
     print(f"\nSemáforo principal: {EMOJI[monitor.cor_principal()]} "
           f"{ESTADO_TEXTO[monitor.cor_principal()]}")
     print(f"VSCode CLI: {CODE_BIN or 'NÃO ENCONTRADO'}")
