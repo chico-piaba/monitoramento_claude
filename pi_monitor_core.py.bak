@@ -209,7 +209,7 @@ class UnifiedLogParser:
             # Encontra os .jsonl (transcripts)
             for jsonl_file in project_dir.glob("*.jsonl"):
                 try:
-                    session_data = _parse_claude_code_transcript_standalone(jsonl_file, project_dir.name)
+                    session_data = parse_claude_code_transcript(jsonl_file, project_dir.name)
                     if session_data:
                         # Prefixo para distinguir de pi agent
                         session_id = f"claude-code:{jsonl_file.stem}"
