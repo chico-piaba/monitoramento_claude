@@ -1,0 +1,519 @@
+"""Core de coleta de métricas do pi agent e Claude Code a partir dos logs."""
+
+import os
+import re
+import json
+import logging
+from pathlib import Path
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass, asdict, field
+from collections import defaultdict
+import sqlite3
+from threading import Lock
+
+from pi_monitor_config import (
+    PI_LOGS_DIR,
+    PI_SESSIONS_DIR,
+    MONITOR_DB,
+    MODEL_TOKEN_LIMITS,
+    SUBAGENT_PATTERNS,
+    TokenThresholds,
+    ContextThresholds,
+    get_token_limit,
+    get_context_window,
+)
+
+logger = logging.getLogger(__name__)
+
+# Também suporte Claude Code
+CLAUDE_CODE_SESSION_DIR = Path.home() / ".claude" / "projects"
+
+# ============================================================================
+# MODELOS DE DADOS
+# ============================================================================
+@dataclass
+class SubagentMetrics:
+    """Métricas de um subagent."""
+    id: str
+    type: str  # "colony", "swarm", "nested", "cascade"
+    status: str = "unknown"
+    tokens_used: int = 0
+    tokens_limit: int = 0
+    start_time: Optional[datetime] = None
+    end_time: Optional[datetime] = None
+
+    def to_dict(self):
+        return {
+            **asdict(self),
+            "start_time": self.start_time.isoformat() if self.start_time else None,
+            "end_time": self.end_time.isoformat() if self.end_time else None,
+        }
+
+
+@dataclass
+class Event:
+    """Um evento na sessão."""
+    timestamp: datetime
+    type: str  # "start", "token_warning", "context_critical", "error", "end", etc
+    level: str  # "info", "warn", "error", "critical"
+    message: str
+    session_id: str
+    details: Dict = field(default_factory=dict)
+
+    def to_dict(self):
+        return {
+            **asdict(self),
+            "timestamp": self.timestamp.isoformat(),
+            "details": self.details,
+        }
+
+
+@dataclass
+class SessionMetrics:
+    """Métricas completas de uma sessão pi."""
+    session_id: str
+    start_time: datetime
+    model: str
+    provider: str
+    status: str = "running"  # "running", "idle", "completed", "error"
+    tokens_used: int = 0
+    tokens_limit: int = 0
+    context_used: int = 0
+    context_window: int = 0
+    subagents: List[SubagentMetrics] = field(default_factory=list)
+    events: List[Event] = field(default_factory=list)
+    end_time: Optional[datetime] = None
+    error_message: Optional[str] = None
+    
+    @property
+    def duration_seconds(self) -> int:
+        """Duração da sessão em segundos."""
+        end = self.end_time or datetime.now()
+        return int((end - self.start_time).total_seconds())
+    
+    @property
+    def token_ratio(self) -> float:
+        """Proporção de tokens usados (0-1)."""
+        if self.tokens_limit == 0:
+            return 0
+        return self.tokens_used / self.tokens_limit
+    
+    @property
+    def context_ratio(self) -> float:
+        """Proporção de contexto usado (0-1)."""
+        if self.context_window == 0:
+            return 0
+        return self.context_used / self.context_window
+    
+    @property
+    def alert_level(self) -> str:
+        """Nível de alerta baseado em métricas."""
+        token_thresholds = TokenThresholds()
+        context_thresholds = ContextThresholds()
+        
+        if self.status == "error":
+            return "critical"
+        if self.token_ratio >= token_thresholds.critical or self.context_ratio >= context_thresholds.critical:
+            return "critical"
+        if self.token_ratio >= token_thresholds.warning or self.context_ratio >= context_thresholds.warning:
+            return "warning"
+        return "info"
+    
+    @property
+    def source_type(self) -> str:
+        """Identifica a origem: 'pi_agent' ou 'claude_code'."""
+        # Heurística: se o session_id tem padrão claude code, marca como tal
+        if "claude-code" in self.session_id.lower() or self.provider == "claude_code":
+            return "claude_code"
+        return "pi_agent"
+    
+    def to_dict(self):
+        return {
+            **asdict(self),
+            "start_time": self.start_time.isoformat(),
+            "end_time": self.end_time.isoformat() if self.end_time else None,
+            "duration_seconds": self.duration_seconds,
+            "token_ratio": self.token_ratio,
+            "context_ratio": self.context_ratio,
+            "alert_level": self.alert_level,
+            "subagents": [s.to_dict() for s in self.subagents],
+            "events": [e.to_dict() for e in self.events],
+        }
+
+
+# ============================================================================
+# PARSER DE LOGS
+# ============================================================================
+class UnifiedLogParser:
+    """Parser dos logs de pi agent E Claude Code."""
+    
+    def __init__(self, pi_logs_dir: Path = PI_LOGS_DIR, claude_code_dir: Path = CLAUDE_CODE_SESSION_DIR):
+        self.pi_logs_dir = pi_logs_dir
+        self.claude_code_dir = claude_code_dir
+        self.sessions: Dict[str, SessionMetrics] = {}
+        self._lock = Lock()
+    
+    def parse_latest_logs(self) -> Dict[str, SessionMetrics]:
+        """Lê os logs mais recentes de pi agent e Claude Code."""
+        sessions = {}
+        
+        # Parse pi agent logs
+        if self.pi_logs_dir.exists():
+            pi_sessions = self._parse_pi_logs()
+            sessions.update(pi_sessions)
+        
+        # Parse Claude Code sessions
+        if self.claude_code_dir.exists():
+            claude_sessions = self._parse_claude_code_sessions()
+            sessions.update(claude_sessions)
+        
+        with self._lock:
+            self.sessions = sessions
+        
+        return sessions
+    
+    def _parse_pi_logs(self) -> Dict[str, SessionMetrics]:
+        """Parse dos logs do pi agent (~/.pi/logs/)."""
+        sessions = {}
+        
+        # Encontra arquivos de log (análiticos ou de eventos)
+        log_files = (
+            list(self.pi_logs_dir.glob("*.json")) + 
+            list(self.pi_logs_dir.glob("*.jsonl")) +
+            list(self.pi_logs_dir.glob("**/*.jsonl"))  # recursivo
+        )
+        
+        for log_file in sorted(log_files, key=lambda p: p.stat().st_mtime, reverse=True)[:20]:
+            try:
+                session_data = self._parse_pi_log_file(log_file)
+                if session_data:
+                    sessions[session_data.session_id] = session_data
+            except Exception as e:
+                logger.debug(f"Erro ao parsear pi log {log_file}: {e}")
+        
+        return sessions
+    
+    def _parse_claude_code_sessions(self) -> Dict[str, SessionMetrics]:
+        """Parse das sessões do Claude Code (~/.claude/projects/)."""
+        sessions = {}
+        
+        # Cada subdiretório em ~/.claude/projects/ é um projeto
+        if not self.claude_code_dir.exists():
+            return sessions
+        
+        for project_dir in self.claude_code_dir.iterdir():
+            if not project_dir.is_dir():
+                continue
+            
+            # Encontra os .jsonl (transcripts)
+            for jsonl_file in project_dir.glob("*.jsonl"):
+                try:
+                    session_data = self._parse_claude_code_transcript(jsonl_file, project_dir.name)
+                    if session_data:
+                        # Prefixo para distinguir de pi agent
+                        session_id = f"claude-code:{jsonl_file.stem}"
+                        sessions[session_id] = session_data
+                except Exception as e:
+                    logger.debug(f"Erro ao parsear Claude Code transcript {jsonl_file}: {e}")
+        
+        return sessions
+    
+    def _parse_log_file(self, log_file: Path) -> Optional[SessionMetrics]:
+        """Parse de um arquivo de log individual."""
+        if not log_file.exists():
+            return None
+        
+        session_id = log_file.stem
+        lines = []
+        
+        try:
+            with open(log_file, 'r') as f:
+                # Para JSONL, lê linha por linha; para JSON, lê tudo
+                if log_file.suffix == '.jsonl':
+                    lines = f.readlines()
+                else:
+                    content = f.read()
+                    try:
+                        lines = [json.dumps(json.loads(content))]
+                    except:
+                        lines = [content]
+        except Exception as e:
+            logger.error(f"Erro ao ler {log_file}: {e}")
+            return None
+        
+        if not lines:
+            return None
+        
+        # Tenta extrair métricas
+        session = SessionMetrics(
+            session_id=session_id,
+            start_time=datetime.fromtimestamp(log_file.stat().st_mtime),
+            model="unknown",
+            provider="unknown",
+            tokens_limit=100_000,
+            context_window=200_000,
+        )
+        
+        # Parse básico
+        for line in lines:
+            try:
+                data = json.loads(line) if isinstance(line, str) else line
+                
+                # Extrai informações de modelo/provider
+                if "model" in data:
+                    session.model = data["model"]
+                    session.tokens_limit = get_token_limit(data["model"])
+                    session.context_window = get_context_window(data["model"])
+                
+                if "provider" in data:
+                    session.provider = data["provider"]
+                
+                # Tokens usados
+                if "usage" in data:
+                    usage = data["usage"]
+                    session.tokens_used = usage.get("total_tokens", session.tokens_used)
+                    session.context_used = usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0)
+                
+                if "input_tokens" in data:
+                    session.tokens_used += data["input_tokens"]
+                if "output_tokens" in data:
+                    session.tokens_used += data["output_tokens"]
+                
+                # Status
+                if "status" in data:
+                    session.status = data["status"]
+                if "error" in data:
+                    session.status = "error"
+                    session.error_message = data["error"]
+                
+                # Subagents
+                self._extract_subagents(data, session)
+                
+            except json.JSONDecodeError:
+                continue
+            except Exception as e:
+                logger.debug(f"Erro ao parsear linha: {e}")
+        
+        return session
+    
+    def _extract_subagents(self, data: dict, session: SessionMetrics):
+        """Extrai informações de subagents do log."""
+        for pattern_name, pattern in SUBAGENT_PATTERNS.items():
+            if "subagents" in data:
+                for sub in data.get("subagents", []):
+                    if re.search(pattern, str(sub).lower()):
+                        subagent = SubagentMetrics(
+                            id=str(sub),
+                            type=pattern_name,
+                            tokens_used=0,
+                        )
+                        session.subagents.append(subagent)
+
+
+# ============================================================================
+# PERSISTÊNCIA EM BANCO DE DADOS
+# ============================================================================
+class MetricsStorage:
+    """Armazena e recupera métricas em SQLite."""
+    
+    def __init__(self, db_path: Path = MONITOR_DB):
+        self.db_path = db_path
+        self._lock = Lock()
+        self._init_db()
+    
+    def _init_db(self):
+        """Inicializa o banco de dados."""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS sessions (
+                    session_id TEXT PRIMARY KEY,
+                    start_time TEXT NOT NULL,
+                    end_time TEXT,
+                    model TEXT,
+                    provider TEXT,
+                    status TEXT,
+                    tokens_used INTEGER,
+                    tokens_limit INTEGER,
+                    context_used INTEGER,
+                    context_window INTEGER,
+                    duration_seconds INTEGER,
+                    error_message TEXT,
+                    data_json TEXT
+                )
+            """)
+            
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL,
+                    timestamp TEXT NOT NULL,
+                    type TEXT NOT NULL,
+                    level TEXT,
+                    message TEXT,
+                    details_json TEXT,
+                    FOREIGN KEY (session_id) REFERENCES sessions(session_id)
+                )
+            """)
+            
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_sessions_start_time 
+                ON sessions(start_time)
+            """)
+            
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_events_session_id 
+                ON events(session_id)
+            """)
+            
+            conn.commit()
+    
+    def save_session(self, session: SessionMetrics):
+        """Salva uma sessão no banco."""
+        with self._lock:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute("""
+                    INSERT OR REPLACE INTO sessions 
+                    (session_id, start_time, end_time, model, provider, status,
+                     tokens_used, tokens_limit, context_used, context_window,
+                     duration_seconds, error_message, data_json)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    session.session_id,
+                    session.start_time.isoformat(),
+                    session.end_time.isoformat() if session.end_time else None,
+                    session.model,
+                    session.provider,
+                    session.status,
+                    session.tokens_used,
+                    session.tokens_limit,
+                    session.context_used,
+                    session.context_window,
+                    session.duration_seconds,
+                    session.error_message,
+                    json.dumps(session.to_dict()),
+                ))
+                conn.commit()
+    
+    def get_recent_sessions(self, hours: int = 24) -> List[SessionMetrics]:
+        """Recupera sessões dos últimas N horas."""
+        cutoff = (datetime.now() - timedelta(hours=hours)).isoformat()
+        
+        with self._lock:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute("""
+                    SELECT data_json FROM sessions
+                    WHERE start_time >= ?
+                    ORDER BY start_time DESC
+                """, (cutoff,)).fetchall()
+        
+        sessions = []
+        for row in rows:
+            try:
+                data = json.loads(row["data_json"])
+                # Reconstruir SessionMetrics a partir do dict é complexo,
+                # então mantemos como dict por enquanto
+                sessions.append(data)
+            except Exception as e:
+                logger.error(f"Erro ao recuperar sessão: {e}")
+        
+        return sessions
+
+
+# ============================================================================
+# MONITOR PRINCIPAL
+# ============================================================================
+class PiAgentMonitor:
+    """Monitor central do pi agent."""
+    
+    def __init__(self):
+        self.parser = PiLogParser()
+        self.storage = MetricsStorage()
+        self.sessions: Dict[str, SessionMetrics] = {}
+        self._previous_alert_levels: Dict[str, str] = {}
+    
+    def refresh(self) -> Dict[str, SessionMetrics]:
+        """Atualiza as métricas e retorna as sessões."""
+        self.sessions = self.parser.parse_latest_logs()
+        
+        for session_id, session in self.sessions.items():
+            # Salva no banco
+            self.storage.save_session(session)
+            
+            # Detecta mudanças de alerta
+            current_level = session.alert_level
+            previous_level = self._previous_alert_levels.get(session_id, "info")
+            
+            if current_level != previous_level:
+                logger.info(f"Alerta em {session_id}: {previous_level} -> {current_level}")
+            
+            self._previous_alert_levels[session_id] = current_level
+        
+        return self.sessions
+    
+    def get_active_sessions(self) -> List[SessionMetrics]:
+        """Retorna apenas as sessões ativas."""
+        return [s for s in self.sessions.values() if s.status in ("running", "idle")]
+    
+    def get_session(self, session_id: str) -> Optional[SessionMetrics]:
+        """Retorna uma sessão específica."""
+        return self.sessions.get(session_id)
+    
+    def get_total_tokens_used(self, session_id: Optional[str] = None) -> int:
+        """Retorna total de tokens usados."""
+        if session_id:
+            session = self.sessions.get(session_id)
+            return session.tokens_used if session else 0
+        return sum(s.tokens_used for s in self.sessions.values())
+    
+    def get_total_cost_estimate(self, session_id: Optional[str] = None) -> float:
+        """Estima o custo baseado em tokens (rates aproximadas)."""
+        RATES_PER_MILLION = {
+            "claude": {"input": 3.0, "output": 15.0},
+            "gpt-4": {"input": 30.0, "output": 60.0},
+            "gpt-3.5": {"input": 0.5, "output": 1.5},
+        }
+        
+        total_cost = 0.0
+        sessions_to_check = [self.sessions.get(session_id)] if session_id else self.sessions.values()
+        
+        for session in sessions_to_check:
+            if not session:
+                continue
+            
+            provider = session.provider.lower()
+            if "anthropic" in provider or "claude" in session.model.lower():
+                rate = RATES_PER_MILLION["claude"]
+            elif "openai" in provider or "gpt" in session.model.lower():
+                if "3.5" in session.model:
+                    rate = RATES_PER_MILLION["gpt-3.5"]
+                else:
+                    rate = RATES_PER_MILLION["gpt-4"]
+            else:
+                continue
+            
+            # Aproximação simples (50% input, 50% output)
+            tokens_used = session.tokens_used
+            cost = (tokens_used * 0.5 / 1_000_000) * rate["input"]
+            cost += (tokens_used * 0.5 / 1_000_000) * rate["output"]
+            total_cost += cost
+        
+        return total_cost
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    
+    monitor = PiAgentMonitor()
+    sessions = monitor.refresh()
+    
+    print(f"Sessões encontradas: {len(sessions)}")
+    for session_id, session in sessions.items():
+        print(f"\n{session_id}:")
+        print(f"  Modelo: {session.model}")
+        print(f"  Tokens: {session.tokens_used}/{session.tokens_limit} ({session.token_ratio:.1%})")
+        print(f"  Contexto: {session.context_used}/{session.context_window} ({session.context_ratio:.1%})")
+        print(f"  Status: {session.status}")
+        print(f"  Alerta: {session.alert_level}")
+        print(f"  Duração: {session.duration_seconds}s")
