@@ -36,7 +36,10 @@ import socket
 from datetime import datetime
 
 import psutil
-from pystray import Icon, Menu, MenuItem
+try:
+    from pystray import Icon, Menu, MenuItem
+except Exception:
+    Icon = Menu = MenuItem = None
 from PIL import Image, ImageDraw
 
 # --- Parâmetros de tempo -----------------------------------------------------
@@ -54,7 +57,7 @@ MARCADOR_EXE = os.path.join("claude", "versions")
 DIR_PROJETOS = os.path.expanduser("~/.claude/projects")
 DIR_IDE_LOCKS = os.path.expanduser("~/.claude/ide")
 DIR_PI_SESSOES = os.path.expanduser("~/.pi/agent/sessions")
-PI_ATIVO_MAX_S = int(os.getenv("PI_ATIVO_MAX_S", "180"))  # sessão pi ativa por janela de atualização
+PI_ATIVO_MAX_S = int(os.getenv("PI_ATIVO_MAX_S", "1800"))  # sessão pi ativa por janela de atualização
 DASHBOARD_URL = "http://localhost:9000"
 AUDIO_ENABLED = True
 
@@ -537,6 +540,8 @@ def _teste_audio(icon=None, item=None):
 
 
 def construir_menu():
+    if Menu is None or MenuItem is None:
+        return None
     instancias, _, _ = monitor.snapshot()
     agora = time.time()
 
@@ -654,6 +659,10 @@ def modo_check():
 def main():
     if "--check" in sys.argv:
         sys.exit(modo_check())
+
+    if Icon is None:
+        print("pystray indisponível neste ambiente (provavelmente headless).")
+        sys.exit(2)
 
     print("Serviço de monitoramento iniciado... ícone criado na bandeja.")
     tray = Icon(
