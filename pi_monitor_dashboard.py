@@ -510,5 +510,5 @@ HTML_TEMPLATE = """
 if __name__ == "__main__":
     import uvicorn
     
-    logger.info("Iniciando dashboard na porta 8888...")
-    uvicorn.run(app, host="localhost", port=8888)
+    logger.info("Iniciando dashboard na porta 9000...")
+    uvicorn.run(app, host="localhost", port=9000)
