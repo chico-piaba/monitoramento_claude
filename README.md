@@ -1,84 +1,172 @@
-# Monitoramento do Claude Code
+# Monitoramento Claude + PI (Tray + Dashboard)
 
-Semáforo na bandeja do sistema que mostra o **status da conversa/produção** de
-cada sessão (instância) do Claude Code em execução. Cada instância ganha seu
-próprio semáforo, e o ícone principal reflete a **última alteração** de status.
+Sistema de observabilidade local para sessões **ativas** do Claude Code e PI Agent:
 
-## Cores (status da conversa)
+- 📍 **Tray (semáforo)** para troca rápida de contexto
+- 📊 **Dashboard web** com status, pendências, tokens, custo e etapa
+- 🔔 **Áudio/notificação** quando entra em estado de atenção
+- 📱 **Visão mobile** (`/mobile`)
 
-| Cor        | Significado                                                        |
-|------------|-------------------------------------------------------------------|
-| 🟢 Verde   | Produzindo — houve atividade nos últimos segundos                 |
-| 🟡 Amarelo | Esperando você — terminou o turno / aguarda input ou decisão      |
-| 🔴 Vermelho| Erro, ou parada/travada há muito tempo sem responder              |
+> Foco: observabilidade e gestão de execução (tempo, custo, estágio, pendências). Sem puppeteering.
 
-O **ícone principal** na bandeja mostra a cor da sessão cujo status mudou mais
-recentemente. O **menu** lista todas as instâncias, cada uma com seu semáforo,
-estado e há quanto tempo foi o último evento. Uma notificação aparece quando a
-cor principal muda.
+---
 
-**Clicar numa instância troca para a janela do VSCode** daquela sessão (foco da
-janela via `code <pasta>`). Cada sessão é ligada à sua janela pelos locks de
-integração em `~/.claude/ide/*.lock`, casando o `cwd` da sessão com o
-`workspaceFolders` da janela.
+## 1) Componentes
 
-> Granularidade: o foco é por **janela/workspace**. Se duas sessões rodam na
-> mesma janela do VSCode (dois terminais lado a lado), o clique foca a janela,
-> mas não dá para escolher o terminal específico — limitação do próprio editor.
+## Tray (`monitoramento_claude.py`)
+- Monitora instâncias ativas de:
+  - Claude (por processo vivo)
+  - PI (por atividade recente do transcript)
+- Semáforo por sessão:
+  - 🟢 produzindo
+  - 🟡 aguardando você / idle
+  - 🔴 erro crítico
+- Clique na sessão tenta focar a janela do VSCode (`code <workspace>`)
+- Menu extra:
+  - Abrir dashboard
+  - Sync no celular
+  - Áudio on/off
+  - Teste de áudio
 
-## Instalação
+## Dashboard (`pi_monitor_dashboard.py`)
+- Fonte de verdade: **snapshot da tray ativa** (evita backlog antigo)
+- Mostra por sessão:
+  - status
+  - contexto resumido
+  - tokens/contexto
+  - custo estimado
+  - estágio (`stage`) + próxima ação (`next_action`)
+- Endpoints:
+  - `/` dashboard principal
+  - `/mobile` versão compacta
+  - `/api/state` JSON
+  - `/ws/monitor` stream em tempo real
+
+---
+
+## 2) Instalação
 
 ```bash
-pip install -r requirements.txt
+cd /Users/rodrigolima/Documents/AI-ASSISTANT/PROJETOS/monitoramento_claude
+pip3 install -r requirements.txt
 ```
 
-## Uso
+---
+
+## 3) Uso local
+
+## Checar sessões ativas
+```bash
+python3 monitoramento_claude.py --check
+```
+
+## Iniciar tray
+```bash
+python3 monitoramento_claude.py
+```
+
+## Iniciar dashboard
+```bash
+python3 pi_monitor_dashboard.py
+# abre em http://localhost:9000
+```
+
+## Reinício rápido
+```bash
+pkill -f monitoramento_claude.py || true
+pkill -f pi_monitor_dashboard.py || true
+python3 monitoramento_claude.py
+python3 pi_monitor_dashboard.py
+```
+
+---
+
+## 4) LM Studio (classificação de etapa)
+
+Compatível com LM Studio local (OpenAI-like).
+
+Variáveis:
 
 ```bash
-# Inicia o app de bandeja
-python monitoramento_claude.py
+export LMSTUDIO_BASE="http://localhost:1234/v1"
+export LMSTUDIO_MODEL="gemma-4"
+export LMSTUDIO_API_KEY="<token>"
 
-# Lista as instâncias e seus estados no terminal, e sai
-python monitoramento_claude.py --check
+export LM_CLASSIFIER_ENABLED=1
+export LM_CLASSIFY_ONLY_ATTENTION=1
+export LM_CLASSIFIER_TIMEOUT_S=3.0
+
+# opcional: override completo do endpoint
+export LMSTUDIO_CHAT_URL=""
 ```
 
-Exemplo de `--check`:
+Fallback de endpoint automático:
+- `.../chat/completions`
+- `.../responses`
 
+Se LM falhar, cai em heurística local (sem quebrar painel).
+
+---
+
+## 5) Docker / CI
+
+Arquivos:
+- `Dockerfile`
+- `.github/workflows/build-docker.yml`
+
+Build local:
+```bash
+docker build -t monitoramento-claude:local .
+docker run --rm -p 9000:9000 monitoramento-claude:local
 ```
-4 instância(s) ativa(s):
 
-  🟡 esperando você (   4s)  alece-play-institutional-reduction  <- última alteração
-  🟢 produzindo     (   6s)  Finalizar desenvolvimento do monitoramento Claude
-  🔴 erro / parada  (  28m)  Revisar estrutura do site
+> Em container/headless, o módulo da tray não derruba o processo (pystray é tratado com fallback).
 
-Semáforo principal: 🟡 esperando você
+---
+
+## 6) Configuração importante
+
+No tray:
+- `PI_ATIVO_MAX_S` (default `1800`): janela de atividade do PI para não “sumir” em idle.
+
+Exemplo:
+```bash
+PI_ATIVO_MAX_S=1800 python3 monitoramento_claude.py
 ```
 
-## Como funciona
+Regras de estado PI:
+- idle sem erro => 🟡
+- erro real => 🔴
 
-- **Instâncias** = processos `claude` vivos na máquina. Quando o terminal é
-  fechado, a instância some da lista.
-- Cada processo é mapeado para o transcript da sessão em
-  `~/.claude/projects/<projeto>/<sessão>.jsonl`, pela pasta de trabalho (cwd) e
-  pelo `.jsonl` modificado mais recentemente.
-- O **estado** vem do transcript: horário do último evento e se o turno
-  terminou (`stop_reason: end_turn`). Apenas o fim do arquivo é lido, então
-  transcripts de dezenas de MB não pesam.
-- O título de cada instância vem do `aiTitle` da sessão.
+---
 
-### Limiares (ajustáveis no topo do `.py`)
+## 7) Persistência
 
-| Constante         | Padrão | Efeito                                              |
-|-------------------|--------|-----------------------------------------------------|
-| `VERDE_MAX_S`     | 60 s   | Atividade dentro disso = 🟢 produzindo              |
-| `VERMELHO_MIN_S`  | 600 s  | Idle além disso = 🔴 travada/abandonada             |
-| `INTERVALO`       | 4 s    | Frequência de verificação                           |
+Snapshots do dashboard em SQLite:
+- `~/.pi_monitor/metrics.db`
+- tabela `dashboard_snapshots`
 
-## Notas técnicas
+---
 
-- A detecção de processos usa `psutil` sobre o `argv[0]` (`claude`) e o caminho
-  do executável (`~/.local/share/claude/versions/...`), pois o binário é
-  versionado e `psutil.name()` retornaria apenas o número da versão.
-- O app é puramente baseado em bandeja (sem janela Tkinter): no macOS tanto o
-  `pystray` quanto o Tkinter exigem a thread principal e os dois `mainloop` não
-  coexistem de forma estável. Todos os detalhes ficam no menu da bandeja.
+## 8) Troubleshooting rápido
+
+### Dashboard não carrega
+- confirme processo:
+```bash
+lsof -i :9000
+```
+- hard refresh no browser: `Cmd+Shift+R`
+
+### PI sumiu
+- aumentar `PI_ATIVO_MAX_S`
+- validar com `--check`
+
+### LM Studio erro de endpoint
+- use `LMSTUDIO_CHAT_URL` ou deixe fallback automático
+- confirme auth local
+
+---
+
+## 9) Changelog
+
+Veja `CHANGELOG.md` para histórico detalhado das implementações.
