@@ -1,3 +1,8 @@
 pystray
 pillow
 psutil
+fastapi>=0.100.0
+uvicorn>=0.23.0
+python-socketio>=5.9.0
+python-engineio>=4.7.0
+aiofiles>=23.2.0
