@@ -39,9 +39,14 @@
 - `LMSTUDIO_BASE` (default: `http://localhost:1234/v1`)
 - `LMSTUDIO_MODEL` (default: `gemma-4`)
 - `LMSTUDIO_API_KEY`
+- `LMSTUDIO_CHAT_URL` (override completo do endpoint)
 - `LM_CLASSIFIER_ENABLED` (`1|0`)
 - `LM_CLASSIFIER_TIMEOUT_S` (default: `3.0`)
 - `LM_CLASSIFY_ONLY_ATTENTION` (`1|0`)
+
+### LM endpoint compatibility
+- Classificador agora tenta endpoints em fallback: `.../chat/completions` e `.../responses`.
+- Parsing compatível com resposta estilo `choices[].message.content` e `output_text`.
 
 ### Notes
 - O tray continua como fonte de verdade para instâncias ativas.

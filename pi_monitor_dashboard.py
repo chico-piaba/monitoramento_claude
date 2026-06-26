@@ -28,6 +28,7 @@ SNAP_DB = Path.home() / ".pi_monitor" / "metrics.db"
 LMSTUDIO_BASE = os.getenv("LMSTUDIO_BASE", "http://localhost:1234/v1")
 LMSTUDIO_MODEL = os.getenv("LMSTUDIO_MODEL", "gemma-4")
 LMSTUDIO_API_KEY = os.getenv("LMSTUDIO_API_KEY", "")
+LMSTUDIO_CHAT_URL = os.getenv("LMSTUDIO_CHAT_URL", "")  # override total, ex: http://localhost:1234/chat/completions
 LM_CLASSIFIER_ENABLED = os.getenv("LM_CLASSIFIER_ENABLED", "1") == "1"
 LM_CLASSIFIER_TIMEOUT_S = float(os.getenv("LM_CLASSIFIER_TIMEOUT_S", "3.0"))
 LM_CLASSIFY_ONLY_ATTENTION = os.getenv("LM_CLASSIFY_ONLY_ATTENTION", "1") == "1"
@@ -185,6 +186,7 @@ def _heuristic_stage(status: str, needs_attention: bool, text: str):
 def _classify_stage_lm(text: str, status: str, needs_attention: bool):
     if not LM_CLASSIFIER_ENABLED:
         return None
+
     payload = {
         "model": LMSTUDIO_MODEL,
         "temperature": 0.1,
@@ -203,28 +205,52 @@ def _classify_stage_lm(text: str, status: str, needs_attention: bool):
             },
         ],
     }
-    try:
-        headers = {"Content-Type": "application/json"}
-        if LMSTUDIO_API_KEY:
-            headers["Authorization"] = f"Bearer {LMSTUDIO_API_KEY}"
 
-        req = urlrequest.Request(
-            f"{LMSTUDIO_BASE}/chat/completions",
-            data=json.dumps(payload).encode("utf-8"),
-            headers=headers,
-            method="POST",
-        )
-        with urlrequest.urlopen(req, timeout=LM_CLASSIFIER_TIMEOUT_S) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-        content = data["choices"][0]["message"]["content"]
-        # tenta extrair JSON mesmo se vier com texto extra
-        start = content.find("{")
-        end = content.rfind("}")
-        if start >= 0 and end > start:
-            parsed = json.loads(content[start:end + 1])
-            return parsed
-    except (URLError, TimeoutError, KeyError, ValueError, json.JSONDecodeError):
-        return None
+    headers = {"Content-Type": "application/json"}
+    if LMSTUDIO_API_KEY:
+        headers["Authorization"] = f"Bearer {LMSTUDIO_API_KEY}"
+
+    base = LMSTUDIO_BASE.rstrip("/")
+    candidates = []
+    if LMSTUDIO_CHAT_URL:
+        candidates.append(LMSTUDIO_CHAT_URL)
+    candidates.extend([
+        f"{base}/chat/completions",
+        f"{base}/responses",
+    ])
+    # evita duplicatas mantendo ordem
+    seen = set()
+    endpoints = [u for u in candidates if not (u in seen or seen.add(u))]
+
+    for endpoint in endpoints:
+        try:
+            req = urlrequest.Request(
+                endpoint,
+                data=json.dumps(payload).encode("utf-8"),
+                headers=headers,
+                method="POST",
+            )
+            with urlrequest.urlopen(req, timeout=LM_CLASSIFIER_TIMEOUT_S) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+
+            # OpenAI chat-completions
+            content = None
+            if isinstance(data, dict) and data.get("choices"):
+                content = data["choices"][0].get("message", {}).get("content")
+            # Responses API-style
+            if not content and isinstance(data, dict):
+                content = data.get("output_text")
+
+            if not content:
+                continue
+
+            start = content.find("{")
+            end = content.rfind("}")
+            if start >= 0 and end > start:
+                return json.loads(content[start:end + 1])
+        except (URLError, TimeoutError, KeyError, ValueError, json.JSONDecodeError):
+            continue
+
     return None
 
 
