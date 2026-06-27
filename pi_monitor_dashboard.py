@@ -67,6 +67,7 @@ class SessionView(BaseModel):
     context_window: int
     context_ratio: float
     duration_seconds: int
+    duration_label: str = "em operação"
     error_message: Optional[str] = None
     has_subagents: bool = False
     context_excerpt: Optional[str] = None
@@ -88,9 +89,14 @@ class SessionView(BaseModel):
             "yellow": "warning",
             "red": "critical",
         }.get(inst.get("cor"), "info")
-        # Mostra tempo no estado atual (mais útil que tempo desde último evento bruto).
+        # Tempo no estado atual (operando/idle/erro)
         base_ts = inst.get("mudou_em") or inst.get("last_ts") or now_ts
         dur = int(max(0, now_ts - base_ts))
+        duration_label = {
+            "running": "operando há",
+            "idle": "idle há",
+            "error": "erro há",
+        }.get(status, "há")
         excerpt = inst.get("last_prompt")
         if isinstance(excerpt, str):
             excerpt = excerpt.strip().replace("\n", " ")[:180]
@@ -117,6 +123,7 @@ class SessionView(BaseModel):
             context_window=context_window,
             context_ratio=context_ratio,
             duration_seconds=dur,
+            duration_label=duration_label,
             error_message=None,
             has_subagents=False,
             context_excerpt=excerpt,
@@ -827,7 +834,7 @@ HTML_TEMPLATE = """
                             <span class="session-badge ${source}">${source}</span>
                         </div>
                         <div class="session-meta">
-                            ${session.model} • ${formatTime(session.duration_seconds)} • etapa: ${session.stage}
+                            ${session.model} • ${session.duration_label} ${formatTime(session.duration_seconds)} • etapa: ${session.stage}
                             ${session.needs_attention ? ' • ⚠️ aguardando você' : ''}
                         </div>
                     </div>
@@ -931,6 +938,8 @@ MOBILE_HTML_TEMPLATE = """
 
 if __name__ == "__main__":
     import uvicorn
-    
-    logger.info("Iniciando dashboard na porta 9000...")
-    uvicorn.run(app, host="localhost", port=9000)
+
+    host = os.getenv("DASHBOARD_HOST", "0.0.0.0")
+    port = int(os.getenv("DASHBOARD_PORT", "9000"))
+    logger.info(f"Iniciando dashboard em {host}:{port}...")
+    uvicorn.run(app, host=host, port=port)
