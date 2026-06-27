@@ -10,8 +10,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     LMSTUDIO_BASE=http://host.docker.internal:1234/v1 \
     LMSTUDIO_CHAT_URL=
 
-COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
+COPY requirements-dashboard.txt ./
+RUN pip install --no-cache-dir -r requirements-dashboard.txt
 
 COPY . .
 

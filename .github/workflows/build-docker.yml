@@ -17,18 +17,25 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build image (no push)
+      - name: Build image (load local for smoke)
         uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Dockerfile
           push: false
-          tags: monitoramento-claude:ci
+          load: true
+          tags: monitoramento-claude:smoke
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
       - name: Smoke test container start
         run: |
-          docker build -t monitoramento-claude:smoke .
           docker run -d --name mon -p 9000:9000 monitoramento-claude:smoke
-          sleep 5
+          for i in {1..20}; do
+            if curl -fsS http://localhost:9000/api/state >/dev/null; then
+              echo "API pronta"; break
+            fi
+            sleep 1
+          done
           curl -f http://localhost:9000/api/state || (docker logs mon && exit 1)
           docker rm -f mon
